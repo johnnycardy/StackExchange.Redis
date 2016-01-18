@@ -5,6 +5,7 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace StackExchange.Redis
 {
@@ -115,19 +116,30 @@ namespace StackExchange.Redis
         private readonly Queue<PhysicalBridge> writeQueue = new Queue<PhysicalBridge>();
 
         bool isDisposed;
+        private bool useHighPrioritySocketThreads = true;
 
         /// <summary>
         /// Creates a new (optionally named) SocketManager instance
         /// </summary>
-        public SocketManager(string name = null)
+        public SocketManager(string name = null) : this(name, true) { }
+
+        /// <summary>
+        /// Creates a new SocketManager instance
+        /// </summary>
+        public SocketManager(string name, bool useHighPrioritySocketThreads)
         {
             if (string.IsNullOrWhiteSpace(name)) name = GetType().Name;
             this.name = name;
+            this.useHighPrioritySocketThreads = useHighPrioritySocketThreads;
 
             // we need a dedicated writer, because when under heavy ambient load
             // (a busy asp.net site, for example), workers are not reliable enough
+#if !CORE_CLR
             Thread dedicatedWriter = new Thread(writeAllQueues, 32 * 1024); // don't need a huge stack;
-            dedicatedWriter.Priority = ThreadPriority.AboveNormal; // time critical
+            dedicatedWriter.Priority = useHighPrioritySocketThreads ? ThreadPriority.AboveNormal : ThreadPriority.Normal;
+#else
+            Thread dedicatedWriter = new Thread(writeAllQueues);
+#endif
             dedicatedWriter.Name = name + ":Write";
             dedicatedWriter.IsBackground = true; // should not keep process alive
             dedicatedWriter.Start(this); // will self-exit when disposed
@@ -168,37 +180,56 @@ namespace StackExchange.Redis
                 this.ShouldForceConnectCompletionType(ref connectCompletionType);
 
                 var formattedEndpoint = Format.ToString(endpoint);
+                var tuple = Tuple.Create(socket, callback);
                 if (endpoint is DnsEndPoint)
                 {
                     // A work-around for a Mono bug in BeginConnect(EndPoint endpoint, AsyncCallback callback, object state)
                     DnsEndPoint dnsEndpoint = (DnsEndPoint)endpoint;
-                    CompletionTypeHelper.RunWithCompletionType(
-                        (cb) =>
-                        {
-                            multiplexer.LogLocked(log, "BeginConnect: {0}", formattedEndpoint);
-                            return socket.BeginConnect(dnsEndpoint.Host, dnsEndpoint.Port, cb, Tuple.Create(socket, callback));
-                        },
-                        (ar) =>
-                        {
-                            multiplexer.LogLocked(log, "EndConnect: {0}", formattedEndpoint);
-                            EndConnectImpl(ar, multiplexer, log);
-                            multiplexer.LogLocked(log, "Connect complete: {0}", formattedEndpoint);
-                        },
-                        connectCompletionType);
-                }
-                else
-                {
+
+#if CORE_CLR
+                    multiplexer.LogLocked(log, "BeginConnect: {0}", formattedEndpoint);
+                    socket.ConnectAsync(dnsEndpoint.Host, dnsEndpoint.Port).ContinueWith(t =>
+                    {
+                        multiplexer.LogLocked(log, "EndConnect: {0}", formattedEndpoint);
+                        EndConnectImpl(t, multiplexer, log, tuple);
+                        multiplexer.LogLocked(log, "Connect complete: {0}", formattedEndpoint);
+                    });
+#else
                     CompletionTypeHelper.RunWithCompletionType(
                         (cb) => {
                             multiplexer.LogLocked(log, "BeginConnect: {0}", formattedEndpoint);
-                            return socket.BeginConnect(endpoint, cb, Tuple.Create(socket, callback));
+                            return socket.BeginConnect(dnsEndpoint.Host, dnsEndpoint.Port, cb, tuple);
                         },
                         (ar) => {
-                            multiplexer.LogLocked(log, "EndConnect: {0}", formattedEndpoint);
-                            EndConnectImpl(ar, multiplexer, log);
+                            multiplexer.LogLocked(log, "EndConnect: {0}", formattedEndpoint);                            
+                            EndConnectImpl(ar, multiplexer, log, tuple);
                             multiplexer.LogLocked(log, "Connect complete: {0}", formattedEndpoint);
                         },
                         connectCompletionType);
+#endif
+                }
+                else
+                {
+#if CORE_CLR
+                    multiplexer.LogLocked(log, "BeginConnect: {0}", formattedEndpoint);
+                    socket.ConnectAsync(endpoint).ContinueWith(t =>
+                    {
+                        multiplexer.LogLocked(log, "EndConnect: {0}", formattedEndpoint);
+                        EndConnectImpl(t, multiplexer, log, tuple);
+                    });
+#else
+                    CompletionTypeHelper.RunWithCompletionType(
+                        (cb) => {
+                            multiplexer.LogLocked(log, "BeginConnect: {0}", formattedEndpoint);
+                            return socket.BeginConnect(endpoint, cb, tuple);
+                        },
+                        (ar) => {
+                            multiplexer.LogLocked(log, "EndConnect: {0}", formattedEndpoint);
+                            EndConnectImpl(ar, multiplexer, log, tuple);
+                            multiplexer.LogLocked(log, "Connect complete: {0}", formattedEndpoint);
+                        },
+                        connectCompletionType);
+#endif
                 }
             } 
             catch (NotImplementedException ex)
@@ -219,6 +250,7 @@ namespace StackExchange.Redis
             // or will be subject to WFP filtering.
             const int SIO_LOOPBACK_FAST_PATH = -1744830448;
 
+#if !CORE_CLR
             // windows only
             if (Environment.OSVersion.Platform == PlatformID.Win32NT)
             {
@@ -230,6 +262,19 @@ namespace StackExchange.Redis
                     socket.IOControl(SIO_LOOPBACK_FAST_PATH, optionInValue, null);
                 }
             }
+#else
+            try
+            {
+                byte[] optionInValue = BitConverter.GetBytes(1);
+                socket.IOControl(SIO_LOOPBACK_FAST_PATH, optionInValue, null);
+            }
+            catch (PlatformNotSupportedException)
+            {
+            }
+            catch (SocketException)
+            {
+            }
+#endif
         }
 
         internal void RequestWrite(PhysicalBridge bridge, bool forced)
@@ -256,18 +301,20 @@ namespace StackExchange.Redis
             Shutdown(token.Socket);
         }
 
-        private void EndConnectImpl(IAsyncResult ar, ConnectionMultiplexer multiplexer, TextWriter log)
+        private void EndConnectImpl(IAsyncResult ar, ConnectionMultiplexer multiplexer, TextWriter log, Tuple<Socket, ISocketCallback> tuple)
         {
-            Tuple<Socket, ISocketCallback> tuple = null;
             try
             {
-                tuple = (Tuple<Socket, ISocketCallback>)ar.AsyncState;
                 bool ignoreConnect = false;
                 ShouldIgnoreConnect(tuple.Item2, ref ignoreConnect);
                 if (ignoreConnect) return;
                 var socket = tuple.Item1;
                 var callback = tuple.Item2;
+#if CORE_CLR
+                multiplexer.Wait((Task)ar); // make it explode if invalid (note: already complete at this point)
+#else
                 socket.EndConnect(ar);
+#endif
                 var netStream = new NetworkStream(socket, false);
                 var socketMode = callback == null ? SocketMode.Abort : callback.Connected(netStream, log);
                 switch (socketMode)
@@ -292,7 +339,7 @@ namespace StackExchange.Redis
                         break;
                 }
             }
-            catch(ObjectDisposedException)
+            catch (ObjectDisposedException)
             {
                 multiplexer.LogLocked(log, "(socket shutdown)");
                 if (tuple != null)
@@ -334,7 +381,9 @@ namespace StackExchange.Redis
             {
                 OnShutdown(socket);
                 try { socket.Shutdown(SocketShutdown.Both); } catch { }
+#if !CORE_CLR
                 try { socket.Close(); } catch { }
+#endif
                 try { socket.Dispose(); } catch { }
             }
         }

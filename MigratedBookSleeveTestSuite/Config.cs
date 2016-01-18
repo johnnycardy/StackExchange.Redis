@@ -122,25 +122,36 @@ namespace Tests
             }
         }
 
-        [Test, ExpectedException(typeof(RedisConnectionException))]
+        [Test]
         public void CanNotOpenNonsenseConnection_IP()
         {
-            var log = new StringWriter();
-            try {
-                using (var conn = ConnectionMultiplexer.Connect(Config.LocalHost + ":6500")) { }
-            } finally {
-                Console.WriteLine(log);
-            }
+            Assert.Throws<RedisConnectionException>(() =>
+            {
+                var log = new StringWriter();
+                try {
+                    using (var conn = ConnectionMultiplexer.Connect(Config.LocalHost + ":6500")) { }
+                }
+                finally {
+                    Console.WriteLine(log);
+                }
+            });
         }
-        [Test, ExpectedException(typeof(RedisConnectionException))]
+
+        [Test]
         public void CanNotOpenNonsenseConnection_DNS()
         {
-            var log = new StringWriter();
-            try {
-                using (var conn = ConnectionMultiplexer.Connect("doesnot.exist.ds.aasd981230d.com:6500", log)) { }
-            } finally {
-                Console.WriteLine(log);
-            }
+            Assert.Throws<RedisConnectionException>(() =>
+            {
+                var log = new StringWriter();
+                try
+                {
+                    using (var conn = ConnectionMultiplexer.Connect("doesnot.exist.ds.aasd981230d.com:6500", log)) { }
+                }
+                finally
+                {
+                    Console.WriteLine(log);
+                }
+            });
         }
 
         [Test]
@@ -174,6 +185,49 @@ namespace Tests
             {
                 Console.WriteLine(log);
             }
+        }
+
+        [Test]
+        public void AbortConnectFalseForAzure()
+        {
+            var options = ConfigurationOptions.Parse("contoso.redis.cache.windows.net");
+            Assert.IsFalse(options.AbortOnConnectFail);
+        }
+
+        [Test]
+        public void AbortConnectTrueForAzureWhenSpecified()
+        {
+            var options = ConfigurationOptions.Parse("contoso.redis.cache.windows.net,abortConnect=true");
+            Assert.IsTrue(options.AbortOnConnectFail);
+        }
+
+        [Test]
+        public void AbortConnectFalseForAzureChina()
+        {
+            // added a few upper case chars to validate comparison
+            var options = ConfigurationOptions.Parse("contoso.REDIS.CACHE.chinacloudapi.cn");
+            Assert.IsFalse(options.AbortOnConnectFail);
+        }
+
+        [Test]
+        public void AbortConnectFalseForAzureUSGov()
+        {
+            var options = ConfigurationOptions.Parse("contoso.redis.cache.usgovcloudapi.net");
+            Assert.IsFalse(options.AbortOnConnectFail);
+        }
+
+        [Test]
+        public void AbortConnectTrueForNonAzure()
+        {
+            var options = ConfigurationOptions.Parse("redis.contoso.com");
+            Assert.IsTrue(options.AbortOnConnectFail);
+        }
+
+        [Test]
+        public void AbortConnectDefaultWhenNoEndpointsSpecifiedYet()
+        {
+            var options = new ConfigurationOptions();
+            Assert.IsTrue(options.AbortOnConnectFail);
         }
 
         internal static void AssertNearlyEqual(double x, double y)
